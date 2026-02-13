@@ -1,0 +1,9 @@
+{
+  "name": "ANA.AI",
+  "description": "Autonomous Neural Assistant. A hybrid local and cloud intelligence interface with real-time screen awareness and multi-model support.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ]
+}
