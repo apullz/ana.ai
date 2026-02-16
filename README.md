@@ -2,6 +2,9 @@
 
 ANA.AI is a high-performance, multimodal intelligence interface that bridges the gap between cloud-scale reasoning and local edge inference. Designed for real-time collaboration, it allows users to interact with state-of-the-art AI models while sharing their screen and voice in a unified, sleek dashboard.
 
+<img width="2560" height="1440" alt="image" src="https://github.com/user-attachments/assets/4696a39b-4636-42b8-95b0-01bb0158cd46" />
+
+
 ## 🚀 Core Features
 
 ### 1. Multimodal Live Session
