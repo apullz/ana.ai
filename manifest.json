@@ -1,0 +1,32 @@
+{
+  "name": "ANA.AI Neural Interface",
+  "short_name": "ANA.AI",
+  "description": "Autonomous Neural Assistant with Screen Awareness",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#020617",
+  "theme_color": "#020617",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/2103/2103633.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/2103/2103633.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Start Neural Session",
+      "url": "/",
+      "icons": [{ "src": "https://cdn-icons-png.flaticon.com/512/2103/2103633.png", "sizes": "192x192" }]
+    }
+  ],
+  "prefer_related_applications": false
+}

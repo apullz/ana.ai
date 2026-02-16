@@ -1,460 +1,420 @@
-
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { pipeline, env } from '@huggingface/transformers';
 import { encode, decode, decodeAudioData } from '../utils/audio-utils';
-import { TranscriptionEntry, ModelID } from '../types';
-import { MODELS } from './Layout';
+import { TranscriptionEntry } from '../types';
 
-// Transformers configuration
-env.allowLocalModels = false;
-env.useBrowserCache = true;
+const TROUBLESHOOTING_INSTRUCTION = `You are ANA, a Senior Technical Solutions Architect.
+Your goal is to help the user troubleshoot AI setups, coding errors, and infrastructure bugs using the provided visual data.
+When a screen share is active:
+1. Scan the screen for Terminal windows, VS Code errors, or Tracebacks.
+2. If you see an error, describe exactly why it is happening and how to fix it.
+3. Keep responses extremely concise and technical.
+4. If you see code, format it nicely in markdown code blocks.
+5. If you don't see any issues, monitor for performance bottlenecks or bad configurations.`;
 
-interface LiveSessionProps {
-  activeModelId: ModelID;
+// --- Code Block Component ---
+interface CodeBlockProps {
+  language: string;
+  code: string;
 }
 
-const LiveSession: React.FC<LiveSessionProps> = ({ activeModelId }) => {
-  const [isActive, setIsActive] = useState(false);
+const CodeBlock: React.FC<CodeBlockProps> = ({ language, code }) => {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = () => {
+    navigator.clipboard.writeText(code);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div className="my-2 rounded-lg overflow-hidden border border-slate-700 bg-slate-950/80 w-full">
+      <div className="flex items-center justify-between px-3 py-1.5 bg-slate-900/80 border-b border-slate-700">
+        <span className="text-[9px] font-mono text-slate-400 lowercase">{language || 'code'}</span>
+        <button 
+          onClick={handleCopy}
+          className="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-wider text-cyan-500 hover:text-cyan-400 transition-colors"
+        >
+          {copied ? (
+            <>
+              <span className="text-green-500">Copied</span>
+              <svg className="w-3 h-3 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+            </>
+          ) : (
+            <>
+              <span>Copy</span>
+              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+            </>
+          )}
+        </button>
+      </div>
+      <pre className="p-3 overflow-x-auto">
+        <code className="font-mono text-[10px] leading-relaxed text-slate-300 block min-w-max">
+          {code}
+        </code>
+      </pre>
+    </div>
+  );
+};
+
+// --- Message Formatter ---
+const formatMessage = (text: string) => {
+  if (!text) return null;
+  // Split by triple backticks: ```language\ncode```
+  // Capturing group 1 is language (optional), group 2 is code.
+  const parts = text.split(/(```[\w-]*\n[\s\S]*?```)/g);
+
+  return parts.map((part, index) => {
+    if (part.startsWith('```') && part.endsWith('```')) {
+      const match = part.match(/```([\w-]*)?\n([\s\S]*?)```/);
+      if (match) {
+        const lang = match[1] || '';
+        const code = match[2];
+        return <CodeBlock key={index} language={lang} code={code} />;
+      }
+    }
+    // Render regular text with line breaks
+    return (
+      <span key={index} className="whitespace-pre-wrap">
+        {part}
+      </span>
+    );
+  });
+};
+
+
+type SessionStatus = 'idle' | 'connecting' | 'active' | 'error';
+
+const LiveSession: React.FC = () => {
+  const [status, setStatus] = useState<SessionStatus>('idle');
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [transcriptions, setTranscriptions] = useState<TranscriptionEntry[]>([]);
-  const [isScreenShared, setIsScreenShared] = useState(false);
-  const [isLocalLoading, setIsLocalLoading] = useState(false);
-  const [isProcessingLocal, setIsProcessingLocal] = useState(false);
-  const [loadProgress, setLoadProgress] = useState(0);
+  const [liveInput, setLiveInput] = useState('');
+  const [liveOutput, setLiveOutput] = useState('');
   
-  // Volume state for visualization
+  const [isScreenShared, setIsScreenShared] = useState(false);
   const [inputLevel, setInputLevel] = useState(0);
   const [outputLevel, setOutputLevel] = useState(0);
+  const [isModelThinking, setIsModelThinking] = useState(false);
 
-  const activeModel = MODELS.find(m => m.id === activeModelId)!;
-
-  // Local Pipeline Refs
-  const localLLMRef = useRef<any>(null);
-  const localSTTRef = useRef<any>(null);
-  const localVisionRef = useRef<any>(null);
-
-  // Gemini Refs
+  // Refs
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef(0);
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const sessionPromiseRef = useRef<Promise<any> | null>(null);
-
-  // Analysis Refs
   const inputAnalyserRef = useRef<AnalyserNode | null>(null);
   const outputAnalyserRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
-
-  // General Media Refs
   const screenStreamRef = useRef<MediaStream | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const videoPreviewRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const frameIntervalRef = useRef<number | null>(null);
+  
+  const currentInputRef = useRef('');
+  const currentOutputRef = useRef('');
+  const chatContainerRef = useRef<HTMLDivElement>(null);
 
-  // Transcription Buffers
-  const currentInputTransRef = useRef('');
-  const currentOutputTransRef = useRef('');
+  // Auto-scroll effect
+  useEffect(() => {
+    if (chatContainerRef.current) {
+      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+    }
+  }, [transcriptions, liveInput, liveOutput]);
 
-  const addLog = useCallback((role: 'user' | 'model', text: string) => {
-    if (!text || !text.trim()) return;
-    setTranscriptions(prev => [...prev, { role, text: text.trim(), timestamp: Date.now() }]);
-  }, []);
-
-  const cleanup = useCallback(() => {
-    if (frameIntervalRef.current) {
-      clearInterval(frameIntervalRef.current);
-      frameIntervalRef.current = null;
-    }
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach(t => t.stop());
-      screenStreamRef.current = null;
-    }
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach(t => t.stop());
-      micStreamRef.current = null;
-    }
+  const cleanup = useCallback(async () => {
+    setStatus('idle');
+    setLiveInput('');
+    setLiveOutput('');
+    currentInputRef.current = '';
+    currentOutputRef.current = '';
+    
+    if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
+    if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+    
+    if (screenStreamRef.current) { screenStreamRef.current.getTracks().forEach(t => t.stop()); screenStreamRef.current = null; }
+    if (micStreamRef.current) { micStreamRef.current.getTracks().forEach(t => t.stop()); micStreamRef.current = null; }
+    
     activeSourcesRef.current.forEach(s => { try { s.stop(); } catch (e) {} });
     activeSourcesRef.current.clear();
     
-    if (inputAudioCtxRef.current) {
-      inputAudioCtxRef.current.close();
-      inputAudioCtxRef.current = null;
-    }
-    if (outputAudioCtxRef.current) {
-      outputAudioCtxRef.current.close();
-      outputAudioCtxRef.current = null;
-    }
+    if (inputAudioCtxRef.current) await inputAudioCtxRef.current.close().catch(() => {});
+    if (outputAudioCtxRef.current) await outputAudioCtxRef.current.close().catch(() => {});
     
-    setIsActive(false);
-    setIsScreenShared(false);
+    inputAudioCtxRef.current = null;
+    outputAudioCtxRef.current = null;
     sessionPromiseRef.current = null;
-    setInputLevel(0);
-    setOutputLevel(0);
+    setIsScreenShared(false);
+    setIsModelThinking(false);
   }, []);
+
+  const resample = (data: Float32Array, fromRate: number, toRate: number): Float32Array => {
+    if (Math.abs(fromRate - toRate) < 1) return data;
+    const ratio = fromRate / toRate;
+    const newLength = Math.round(data.length / ratio);
+    const result = new Float32Array(newLength);
+    for (let i = 0; i < newLength; i++) {
+      const pos = i * ratio;
+      const index = Math.floor(pos);
+      const fraction = pos - index;
+      if (index + 1 < data.length) result[i] = data[index] * (1 - fraction) + data[index + 1] * fraction;
+      else result[i] = data[index];
+    }
+    return result;
+  };
 
   const updateVolumes = useCallback(() => {
     if (inputAnalyserRef.current) {
       const dataArray = new Uint8Array(inputAnalyserRef.current.frequencyBinCount);
       inputAnalyserRef.current.getByteFrequencyData(dataArray);
-      const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
-      setInputLevel(average);
+      setInputLevel(dataArray.reduce((a, b) => a + b, 0) / dataArray.length);
     }
     if (outputAnalyserRef.current) {
       const dataArray = new Uint8Array(outputAnalyserRef.current.frequencyBinCount);
       outputAnalyserRef.current.getByteFrequencyData(dataArray);
-      const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
-      setOutputLevel(average);
+      setOutputLevel(dataArray.reduce((a, b) => a + b, 0) / dataArray.length);
     }
     animationFrameRef.current = requestAnimationFrame(updateVolumes);
   }, []);
 
-  // Initialize Local Models
-  const initLocalModels = async () => {
-    if (activeModel.provider !== 'local') return;
-    setIsLocalLoading(true);
-    setLoadProgress(5);
-    try {
-      if (!localSTTRef.current) {
-        localSTTRef.current = await pipeline('automatic-speech-recognition', 'onnx-community/whisper-tiny.en', {
-          progress_callback: (p: any) => p.status === 'progress' && setLoadProgress(5 + p.progress * 0.15)
-        });
-      }
-      
-      if (!localVisionRef.current) {
-        localVisionRef.current = await pipeline('image-to-text', 'onnx-community/vit-gpt2-image-captioning', {
-          progress_callback: (p: any) => p.status === 'progress' && setLoadProgress(20 + p.progress * 0.2)
-        });
-      }
-
-      // Using Gemma 3 4B
-      localLLMRef.current = await pipeline('text-generation', activeModel.huggingFaceId!, {
-        dtype: 'q4', // Quantization for performance
-        progress_callback: (p: any) => p.status === 'progress' && setLoadProgress(40 + p.progress * 0.6)
-      });
-      
-      setLoadProgress(100);
-      setIsLocalLoading(false);
-    } catch (err) {
-      console.error('Local model initialization error:', err);
-      setIsLocalLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    if (activeModel.provider === 'local') {
-      initLocalModels();
-    }
-  }, [activeModelId]);
-
   const handleStartSession = async () => {
-    if (activeModel.provider === 'local') {
-      setIsActive(true);
-      return;
-    }
+    if (status === 'connecting') return;
+    
+    await cleanup();
+    setErrorMsg(null);
+    setStatus('connecting');
 
     try {
-      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      inputAudioCtxRef.current = inputCtx;
-      outputAudioCtxRef.current = outputCtx;
-      if (inputCtx.state === 'suspended') await inputCtx.resume();
-      if (outputCtx.state === 'suspended') await outputCtx.resume();
-      
+      // 1. Get Streams (Mic + Screen)
       const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      let screenStream: MediaStream;
+      
+      try {
+        screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      } catch (err) {
+        // User cancelled screen share, abort session
+        micStream.getTracks().forEach(t => t.stop());
+        setStatus('idle');
+        return;
+      }
+
+      // 2. Setup Refs & State
       micStreamRef.current = micStream;
+      screenStreamRef.current = screenStream;
+      setIsScreenShared(true);
 
-      // Setup Analyzers
-      const inputAnalyser = inputCtx.createAnalyser();
-      inputAnalyser.fftSize = 256;
-      inputAnalyserRef.current = inputAnalyser;
+      // Handle user clicking "Stop Sharing" in browser UI
+      screenStream.getVideoTracks()[0].onended = () => {
+         setIsScreenShared(false);
+         // Optionally close session or just stop video. Let's keep session alive but stop video.
+         if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
+         screenStreamRef.current = null;
+      };
 
-      const outputAnalyser = outputCtx.createAnalyser();
-      outputAnalyser.fftSize = 256;
-      outputAnalyserRef.current = outputAnalyser;
+      // 3. Setup Audio Contexts
+      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      inputAudioCtxRef.current = inputCtx; 
+      const inputAnalyser = inputCtx.createAnalyser(); inputAnalyser.fftSize = 256; inputAnalyserRef.current = inputAnalyser;
+      const source = inputCtx.createMediaStreamSource(micStream); source.connect(inputAnalyser);
+
+      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      outputAudioCtxRef.current = outputCtx;
+      const outputAnalyser = outputCtx.createAnalyser(); outputAnalyser.fftSize = 256; outputAnalyserRef.current = outputAnalyser;
       outputAnalyser.connect(outputCtx.destination);
       
+      // 4. Connect to Gemini Live
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         callbacks: {
           onopen: () => {
-            setIsActive(true);
-            const source = inputCtx.createMediaStreamSource(micStream);
+            setStatus('active');
+            
+            // Start Audio Processing
             const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
-            
-            source.connect(inputAnalyser);
-            
             scriptProcessor.onaudioprocess = (e) => {
-              const inputData = e.inputBuffer.getChannelData(0);
-              const fromRate = e.inputBuffer.sampleRate;
-              const ratio = fromRate / 16000;
-              const newLength = Math.floor(inputData.length / ratio);
-              const int16 = new Int16Array(newLength);
-              for (let i = 0; i < newLength; i++) {
-                int16[i] = inputData[Math.floor(i * ratio)] * 32768;
-              }
-              const pcmBlob = {
-                data: encode(new Uint8Array(int16.buffer)),
-                mimeType: 'audio/pcm;rate=16000',
-              };
-              sessionPromise.then(session => session.sendRealtimeInput({ media: pcmBlob })).catch(() => {});
+              const resampled = resample(e.inputBuffer.getChannelData(0), inputCtx.sampleRate, 16000);
+              const int16 = new Int16Array(resampled.length);
+              for (let i = 0; i < resampled.length; i++) int16[i] = resampled[i] * 32768;
+              sessionPromise.then(s => s.sendRealtimeInput({ media: { data: encode(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' } }));
             };
-            source.connect(scriptProcessor);
-            scriptProcessor.connect(inputCtx.destination);
+            source.connect(scriptProcessor); scriptProcessor.connect(inputCtx.destination);
             
+            // Start Video Frame Processing (Integrated)
+            frameIntervalRef.current = window.setInterval(() => {
+              if (!videoPreviewRef.current || !canvasRef.current || !screenStreamRef.current) return;
+              const c = canvasRef.current; 
+              const ctx = c.getContext('2d')!;
+              // Ensure canvas matches video aspect ratio
+              const vW = videoPreviewRef.current.videoWidth;
+              const vH = videoPreviewRef.current.videoHeight;
+              if (vW && vH) {
+                 c.width = 1024; 
+                 c.height = 1024 * (vH / vW);
+                 ctx.drawImage(videoPreviewRef.current, 0, 0, c.width, c.height);
+                 c.toBlob(b => {
+                   if (b) {
+                     const r = new FileReader(); r.readAsDataURL(b); r.onloadend = () => {
+                       const b64 = (r.result as string).split(',')[1];
+                       sessionPromise.then(s => s.sendRealtimeInput({ media: { data: b64, mimeType: 'image/jpeg' } }));
+                     };
+                   }
+                 }, 'image/jpeg', 0.6);
+              }
+            }, 1000); // 1 FPS for screen share analysis is usually sufficient and saves bandwidth
+
             updateVolumes();
           },
-          onmessage: async (message: LiveServerMessage) => {
-            const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (base64Audio && outputAudioCtxRef.current && outputAnalyserRef.current) {
-              const ctx = outputAudioCtxRef.current;
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-              const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
-              const source = ctx.createBufferSource();
-              source.buffer = audioBuffer;
-              source.connect(outputAnalyserRef.current);
-              source.addEventListener('ended', () => activeSourcesRef.current.delete(source));
-              source.start(nextStartTimeRef.current);
-              nextStartTimeRef.current += audioBuffer.duration;
-              activeSourcesRef.current.add(source);
+          onmessage: async (m: LiveServerMessage) => {
+            const audio = m.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+            if (audio && outputAudioCtxRef.current) {
+              const ctx = outputAudioCtxRef.current; nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+              const buf = await decodeAudioData(decode(audio), ctx, 24000, 1);
+              const src = ctx.createBufferSource(); src.buffer = buf; src.connect(outputAnalyser); src.start(nextStartTimeRef.current);
+              nextStartTimeRef.current += buf.duration; activeSourcesRef.current.add(src);
             }
-            if (message.serverContent?.inputTranscription) currentInputTransRef.current += message.serverContent.inputTranscription.text;
-            if (message.serverContent?.outputTranscription) currentOutputTransRef.current += message.serverContent.outputTranscription.text;
-            if (message.serverContent?.turnComplete) {
-              addLog('user', currentInputTransRef.current);
-              addLog('model', currentOutputTransRef.current);
-              currentInputTransRef.current = '';
-              currentOutputTransRef.current = '';
-            }
-            if (message.serverContent?.interrupted) {
-              activeSourcesRef.current.forEach(s => { try { s.stop(); } catch(e){} });
-              activeSourcesRef.current.clear();
-              nextStartTimeRef.current = 0;
+            if (m.serverContent?.inputTranscription) { currentInputRef.current += m.serverContent.inputTranscription.text; setLiveInput(currentInputRef.current); }
+            if (m.serverContent?.outputTranscription) { setIsModelThinking(true); currentOutputRef.current += m.serverContent.outputTranscription.text; setLiveOutput(currentOutputRef.current); }
+            if (m.serverContent?.turnComplete) {
+              const userText = currentInputRef.current;
+              const modelText = currentOutputRef.current;
+              
+              setTranscriptions(p => {
+                const newTranscriptions = [...p];
+                if (userText.trim()) newTranscriptions.push({ role: 'user', text: userText, timestamp: Date.now() });
+                if (modelText.trim()) newTranscriptions.push({ role: 'model', text: modelText, timestamp: Date.now() });
+                return newTranscriptions;
+              });
+
+              currentInputRef.current = ''; 
+              currentOutputRef.current = ''; 
+              setLiveInput(''); 
+              setLiveOutput(''); 
+              setIsModelThinking(false);
             }
           },
           onclose: () => cleanup(),
+          onerror: () => setStatus('error'),
         },
         config: {
-          responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
+          responseModalities: [Modality.AUDIO], inputAudioTranscription: {}, outputAudioTranscription: {},
+          systemInstruction: TROUBLESHOOTING_INSTRUCTION,
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } },
-          systemInstruction: 'You are ANA.AI, a high-performance assistant. Use the shared screen content to provide intelligent and relevant feedback. Respond conversationally and concisely.',
         }
       });
       sessionPromiseRef.current = sessionPromise;
-    } catch (err) {
-      console.error('Session failed:', err);
-      cleanup();
+    } catch (err) { 
+      console.error(err);
+      setStatus('error'); 
+      setErrorMsg("Connection failed");
     }
   };
 
-  const handleShareScreen = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ 
-        video: { frameRate: 15, cursor: 'always' } as any, 
-        audio: false 
-      });
-      screenStreamRef.current = stream;
-      if (videoPreviewRef.current) videoPreviewRef.current.srcObject = stream;
-      setIsScreenShared(true);
-      stream.getTracks()[0].onended = () => cleanup();
-
-      if (activeModel.provider === 'google') {
-        const sessionPromise = sessionPromiseRef.current;
-        frameIntervalRef.current = window.setInterval(async () => {
-          if (!videoPreviewRef.current || !sessionPromise || !canvasRef.current) return;
-          const video = videoPreviewRef.current;
-          const canvas = canvasRef.current;
-          const ctx = canvas.getContext('2d');
-          if (!ctx || video.videoWidth === 0) return;
-
-          const scale = Math.min(1, 1024 / video.videoWidth);
-          canvas.width = video.videoWidth * scale;
-          canvas.height = video.videoHeight * scale;
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          
-          canvas.toBlob(async (blob) => {
-            if (blob) {
-              const reader = new FileReader();
-              reader.readAsDataURL(blob);
-              reader.onloadend = () => {
-                const base64Data = (reader.result as string).split(',')[1];
-                sessionPromise.then((session: any) => {
-                  session.sendRealtimeInput({ media: { data: base64Data, mimeType: 'image/jpeg' } });
-                }).catch(() => {});
-              };
-            }
-          }, 'image/jpeg', 0.6);
-        }, 1500);
-      }
-    } catch (err) {
-      console.error('Screen share error:', err);
-      setIsScreenShared(false);
-    }
-  };
-
+  // Sync Video Preview when screen is shared
   useEffect(() => {
-    if (isScreenShared && screenStreamRef.current && videoPreviewRef.current) {
+    if (isScreenShared && videoPreviewRef.current && screenStreamRef.current) {
       videoPreviewRef.current.srcObject = screenStreamRef.current;
     }
   }, [isScreenShared]);
 
-  // Derived visibility state
-  const isUserSpeaking = inputLevel > 15;
-  const isModelSpeaking = outputLevel > 15;
-
   return (
-    <div className="flex flex-col h-full bg-slate-950 p-6 overflow-hidden relative">
-      <div className="flex justify-between items-center mb-6">
-        <div>
-          <h2 className="text-xl font-black text-white tracking-tighter flex items-center gap-2">
-            {activeModel.name.toUpperCase()}
-            <span className="text-[10px] bg-slate-800 text-slate-500 px-1.5 py-0.5 rounded">V1.2</span>
-          </h2>
-          <p className="text-slate-500 text-[10px] uppercase font-bold tracking-widest mt-1">
-            {activeModel.provider === 'google' ? 'Cloud Multimodal Engine' : 'Edge Inference Unit'}
-          </p>
-        </div>
+    <div className="flex flex-col h-full bg-slate-950 p-4 md:p-6 overflow-hidden font-mono-code">
+      {errorMsg && (
+        <div className="mb-4 p-3 bg-red-950/40 border border-red-500/50 rounded-xl text-red-500 text-[10px] font-black uppercase text-center">{errorMsg}</div>
+      )}
 
-        <div className="flex gap-3">
-          {isLocalLoading ? (
-            <div className="flex flex-col items-end">
-              <span className="text-[9px] text-slate-500 font-bold mb-1 uppercase tracking-tighter">Syncing Neural Weights</span>
-              <div className="w-48 bg-slate-900 h-1.5 rounded-full overflow-hidden border border-slate-800">
-                <div className="bg-purple-500 h-full transition-all duration-300" style={{ width: `${loadProgress}%` }}></div>
-              </div>
-            </div>
-          ) : !isActive ? (
-            <button
-              onClick={handleStartSession}
-              className={`px-6 py-2 rounded text-[10px] font-black uppercase transition-all active:scale-95 border ${
-                activeModel.provider === 'google' 
-                  ? 'bg-cyan-600 border-cyan-500 hover:bg-cyan-500 text-white shadow-[0_0_15px_rgba(6,182,212,0.3)]' 
-                  : 'bg-purple-600 border-purple-500 hover:bg-purple-500 text-white'
-              }`}
-            >
-              Initialize {activeModel.name.split(' ')[0]}
-            </button>
+      <div className="flex flex-col sm:flex-row justify-between items-center mb-6 gap-4 z-20">
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 rounded-full px-3 py-1">
+             <div className={`w-2 h-2 rounded-full ${status === 'active' ? 'bg-cyan-500 animate-pulse' : 'bg-slate-700'}`} />
+             <span className="text-[10px] font-bold text-slate-400 uppercase">{status}</span>
+          </div>
+        </div>
+        
+        <div className="flex gap-2 w-full sm:w-auto">
+          {status === 'active' ? (
+            <button onClick={cleanup} className="flex-1 sm:flex-none px-6 py-2 bg-red-950/40 border border-red-500 text-red-500 rounded-xl text-[10px] font-black uppercase hover:bg-red-500 hover:text-white transition-all">Kill Session</button>
           ) : (
-            <button
-              onClick={cleanup}
-              className="px-4 py-2 bg-red-950/20 border border-red-900 text-red-500 rounded text-[10px] font-black uppercase hover:bg-red-900 hover:text-white transition-all"
-            >
-              Terminate
-            </button>
-          )}
-          {isActive && !isScreenShared && (
-            <button
-              onClick={handleShareScreen}
-              className="px-4 py-2 bg-slate-900 border border-slate-700 text-slate-300 rounded text-[10px] font-black uppercase hover:border-slate-400 transition-all flex items-center gap-2"
-            >
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
-              Vision Link
+            <button onClick={handleStartSession} disabled={status === 'connecting'} className="flex-1 sm:flex-none px-6 py-2 bg-cyan-600 border border-cyan-500 text-white rounded-xl text-[10px] font-black uppercase shadow-lg shadow-cyan-900/40 hover:bg-cyan-500 transition-all">
+              {status === 'connecting' ? 'SYNCING...' : 'INITIALIZE VISUAL SYNC'}
             </button>
           )}
         </div>
       </div>
 
-      <div className="flex-1 flex gap-6 min-h-0">
-        <div className="flex-1 bg-black/40 rounded-xl border border-slate-800/50 relative overflow-hidden flex flex-col group shadow-inner">
-          <div className="absolute top-4 left-4 z-10 flex flex-col gap-2">
-            <div className="flex items-center gap-2 bg-black/60 backdrop-blur-md px-3 py-1.5 rounded border border-white/5">
-              <div className={`w-1.5 h-1.5 rounded-full ${isActive ? 'bg-cyan-500 animate-pulse' : 'bg-slate-700'}`} />
-              <span className="text-[9px] font-black text-white tracking-widest uppercase">{isActive ? 'Session_Live' : 'System_Idle'}</span>
+      <div className="flex-1 flex flex-col md:flex-row gap-6 min-h-0">
+        {/* Left: Video Preview */}
+        <div className="flex-[3] bg-black/60 rounded-[2rem] border border-slate-800 relative overflow-hidden flex flex-col shadow-2xl">
+          {isScreenShared ? (
+            <div className="w-full h-full relative group">
+              <video ref={videoPreviewRef} autoPlay muted playsInline className="w-full h-full object-contain" />
+              <div className="absolute inset-0 border-2 border-cyan-500/10 pointer-events-none rounded-[2rem] shadow-[inset_0_0_100px_rgba(6,182,212,0.1)]" />
+              <div className="absolute top-4 right-4 bg-cyan-600/20 backdrop-blur-md border border-cyan-500/40 px-3 py-1 rounded-full flex items-center gap-2">
+                 <div className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
+                 <span className="text-[8px] font-black text-cyan-400 tracking-widest uppercase">Streaming Visual Data</span>
+              </div>
             </div>
-            {isUserSpeaking && (
-              <div className="flex items-center gap-2 bg-blue-500/20 backdrop-blur-md px-3 py-1 rounded border border-blue-500/40 animate-pulse">
-                <div className="w-1 h-1 bg-blue-400 rounded-full" />
-                <span className="text-[8px] font-black text-blue-300 tracking-widest uppercase">Operator_Speaking</span>
+          ) : (
+            <div className="flex-1 flex flex-col items-center justify-center relative">
+              <div className="flex items-end gap-1 px-4 h-32 w-full justify-center opacity-20">
+                {[...Array(24)].map((_, i) => (
+                  <div key={i} className={`w-1.5 rounded-full bg-slate-800 transition-all duration-300`} style={{ height: `${20 + Math.random() * 40}%` }} />
+                ))}
+              </div>
+              <p className="mt-8 text-[10px] font-black text-slate-700 uppercase tracking-[0.4em]">Awaiting Vision Pulse...</p>
+            </div>
+          )}
+          <canvas ref={canvasRef} className="hidden" />
+        </div>
+
+        {/* Right: Activity Stream */}
+        <div className="flex-1 min-w-[320px] bg-slate-900/40 border border-slate-800 rounded-[2rem] flex flex-col shadow-2xl backdrop-blur-md overflow-hidden">
+          <div className="p-4 border-b border-slate-800 bg-black/20 flex items-center justify-between shrink-0">
+            <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest">Neural activity</span>
+            <div className={`w-2 h-2 rounded-full ${isModelThinking ? 'bg-cyan-500 animate-ping' : 'bg-slate-800'}`} />
+          </div>
+          
+          <div ref={chatContainerRef} className="flex-1 overflow-y-auto p-4 space-y-4 scroll-smooth">
+            {transcriptions.map((t, i) => (
+              <div key={i} className={`flex flex-col ${t.role === 'user' ? 'items-end' : 'items-start'} animate-in fade-in slide-in-from-bottom-2 duration-300`}>
+                <span className={`text-[8px] font-black uppercase mb-1 ${t.role === 'user' ? 'text-blue-500' : 'text-cyan-500'}`}>{t.role}</span>
+                <div className={`max-w-[90%] text-[10px] p-3 rounded-2xl border ${t.role === 'user' ? 'bg-slate-800/60 border-slate-700 text-slate-300' : 'bg-cyan-950/10 border-cyan-800/40 text-cyan-100'}`}>
+                  {formatMessage(t.text)}
+                </div>
+              </div>
+            ))}
+            {liveInput && (
+              <div className="text-[10px] text-blue-500/60 font-black italic animate-pulse text-right">
+                <span className="block mb-1 text-[8px] uppercase not-italic text-blue-500">User (Listening)</span>
+                {liveInput}...
               </div>
             )}
-            {isModelSpeaking && (
-              <div className="flex items-center gap-2 bg-cyan-500/20 backdrop-blur-md px-3 py-1 rounded border border-cyan-500/40 animate-pulse">
-                <div className="w-1 h-1 bg-cyan-400 rounded-full" />
-                <span className="text-[8px] font-black text-cyan-300 tracking-widest uppercase">ANA_Speaking</span>
+            {liveOutput && (
+              <div className="text-[10px] text-cyan-500/60 font-black italic animate-pulse">
+                <span className="block mb-1 text-[8px] uppercase not-italic text-cyan-500">ANA (Thinking)</span>
+                 {/* Only format completed output to prevent flicker, or simple text for live */}
+                {liveOutput}...
               </div>
             )}
           </div>
           
-          <div className="flex-1 flex items-center justify-center relative">
-            <video 
-              ref={videoPreviewRef} 
-              autoPlay 
-              muted 
-              playsInline
-              className={`max-w-full max-h-full object-contain shadow-2xl transition-opacity duration-500 ${isScreenShared ? 'opacity-100' : 'opacity-0 absolute pointer-events-none'}`}
-            />
-            {!isScreenShared && (
-              <div className="text-center opacity-30 select-none">
-                <div className="w-16 h-16 border border-slate-700 rounded-full flex items-center justify-center mx-auto mb-4">
-                  <svg className="w-8 h-8 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+          <div className="h-20 border-t border-slate-800 bg-black/30 p-4 flex gap-4 shrink-0">
+             <div className="flex-1 flex flex-col">
+                <span className="text-[7px] font-black text-slate-600 uppercase mb-1 italic">Input Voice</span>
+                <div className="flex-1 flex items-center gap-1">
+                   {[...Array(12)].map((_, i) => (
+                     <div key={i} className={`flex-1 rounded-full transition-all duration-100 ${inputLevel > 15 ? 'bg-blue-500' : 'bg-slate-800'}`} style={{ height: `${5 + (inputLevel / 2) * Math.random()}%` }} />
+                   ))}
                 </div>
-                <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">Video_Input_Awaiting</p>
-              </div>
-            )}
-            {/* Visualizer bars overlapping the preview slightly */}
-            <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-end gap-1 px-4 py-2 bg-black/40 rounded-full backdrop-blur-sm border border-white/5 opacity-80">
-              {[...Array(12)].map((_, i) => (
-                <div 
-                  key={i} 
-                  className={`w-1 rounded-full transition-all duration-75 ${isUserSpeaking ? 'bg-blue-500' : isModelSpeaking ? 'bg-cyan-500' : 'bg-slate-800'}`}
-                  style={{ height: isActive ? `${4 + Math.random() * (isUserSpeaking || isModelSpeaking ? 16 : 4)}px` : '4px' }}
-                />
-              ))}
-            </div>
-          </div>
-          <canvas ref={canvasRef} className="hidden" />
-        </div>
-
-        <div className="w-80 bg-slate-900/50 border border-slate-800 rounded-xl flex flex-col min-h-0 shadow-2xl backdrop-blur-sm">
-          <div className="p-4 border-b border-slate-800 bg-black/20 flex items-center justify-between">
-            <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Neural_Activity_Log</h3>
-            <div className="flex gap-1 items-end">
-              {[0.4, 1, 0.7].map((o, i) => (
-                <div 
-                  key={i} 
-                  className={`w-1 rounded-full transition-all ${isActive ? 'bg-cyan-500 shadow-[0_0_8px_rgba(6,182,212,0.4)]' : 'bg-slate-800'}`}
-                  style={{ 
-                    height: isActive ? `${8 + (isUserSpeaking || isModelSpeaking ? Math.random() * 12 : 0)}px` : '4px',
-                    opacity: o 
-                  }}
-                />
-              ))}
-            </div>
-          </div>
-          <div className="flex-1 overflow-y-auto p-4 space-y-6 scrollbar-thin">
-            {transcriptions.length === 0 && (
-              <div className="h-full flex flex-col items-center justify-center text-center opacity-10">
-                 <p className="text-[10px] font-black uppercase tracking-tighter">Awaiting_Neural_Handshake</p>
-              </div>
-            )}
-            {transcriptions.map((t, i) => (
-              <div key={i} className={`flex flex-col ${t.role === 'user' ? 'items-end text-right' : 'items-start text-left'}`}>
-                <div className="flex items-center gap-2 mb-1 opacity-50">
-                  <span className="text-[8px] font-black uppercase tracking-widest text-slate-500">
-                    {new Date(t.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                  </span>
-                  <span className={`text-[8px] font-black uppercase tracking-widest ${t.role === 'user' ? 'text-blue-400' : 'text-cyan-400'}`}>
-                    {t.role === 'user' ? 'ACCESS_USER' : 'ANA_ENGINE'}
-                  </span>
+             </div>
+             <div className="flex-1 flex flex-col">
+                <span className="text-[7px] font-black text-slate-600 uppercase mb-1 italic">Neural Engine</span>
+                <div className="flex-1 flex items-center gap-1">
+                   {[...Array(12)].map((_, i) => (
+                     <div key={i} className={`flex-1 rounded-full transition-all duration-100 ${outputLevel > 15 || isModelThinking ? 'bg-cyan-500' : 'bg-slate-800'}`} style={{ height: `${5 + (outputLevel / 2) * Math.random()}%` }} />
+                   ))}
                 </div>
-                <div className={`max-w-[95%] text-[11px] leading-relaxed p-2.5 rounded border transition-all ${
-                  t.role === 'user' 
-                    ? 'bg-slate-800/50 border-slate-700 text-slate-300' 
-                    : 'bg-cyan-950/20 border-cyan-800/40 text-cyan-100 shadow-[0_0_15px_rgba(6,182,212,0.05)]'
-                }`}>
-                  {t.text}
-                </div>
-              </div>
-            ))}
-            <div id="scroll-bottom" />
+             </div>
           </div>
         </div>
       </div>

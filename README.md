@@ -17,38 +17,58 @@ ANA.AI is a high-performance, multimodal intelligence interface that bridges the
 - **Deep Video Understanding**: In-depth semantic analysis of video files using Gemini 3 Pro, including temporal markers and object identification.
 - **Neural TTS**: High-fidelity text-to-speech synthesis with multiple prebuilt voice characters (Zephyr, Kore, Puck, etc.).
 
-### 4. Developer Control
-- **Secure Auth Management**: Built-in developer settings for managing Hugging Face tokens and API keys via LocalStorage.
-- **Neural Activity Log**: Detailed transcription history and system status telemetry.
-
 ## 🛠 Installation & Setup
 
 ### Prerequisites
-- A modern browser with **WebGPU** support (Chrome/Edge recommended) for local model acceleration.
+- **Node.js** (v18 or higher) installed on your machine.
 - A **Google AI Studio API Key**.
-- (Optional) A **Hugging Face Access Token** for downloading gated models like Gemma 3.
 
-### Steps
-1. **Clone the Project**:
-   ```bash
-   git clone <repository-url>
-   cd ana-ai
-   ```
+### Step-by-Step Guide
 
-2. **Install Dependencies**:
-   ```bash
-   npm install
-   ```
+#### 1. Get your API Key
+You strictly need a valid API key from Google.
+1. Go to [Google AI Studio](https://aistudio.google.com/app/apikey).
+2. Click **Create API Key**.
+3. Copy the key string.
 
-3. **Configure Environment**:
-   Create a `.env` file (or set in your environment):
-   - `API_KEY`: Your Gemini API Key.
-   - `NEXT_PUBLIC_HF_TOKEN`: Your Hugging Face token.
+#### 2. Install the App
+Open your terminal/command prompt and run:
 
-4. **Launch Application**:
-   ```bash
-   npm run dev
-   ```
+```bash
+# Clone the repository (if you haven't already)
+git clone <repository-url>
+cd ana-ai
+
+# Install dependencies
+npm install
+```
+
+#### 3. Configure Environment (Critical)
+The application will not connect without the API key.
+1. Create a new file in the root folder named `.env` (no extension).
+2. Paste your API key inside it like this:
+
+```env
+API_KEY=your_actual_api_key_string_here
+```
+
+#### 4. Run the Application
+Start the development server:
+
+```bash
+npm run dev
+```
+Then open your browser to the local URL provided (usually `http://localhost:5173`).
+
+## ⚠️ Troubleshooting
+
+**Issue: Screen share starts, but then immediately stops/cancels.**
+*   **Cause:** This usually means the API Key is missing or invalid. The app attempts to connect to Gemini, fails authentication (Error 400/403), and automatically cleans up the video stream to reset the state.
+*   **Fix:** Ensure your `.env` file exists in the root directory and contains a valid `API_KEY`.
+
+**Issue: "Connection Failed" error.**
+*   **Cause:** Network firewall or invalid model name.
+*   **Fix:** Check your internet connection and ensure you are using the correct model names in the code (default is `gemini-2.5-flash-native-audio-preview-12-2025`).
 
 ## 🖥 Hardware Acceleration
 ANA.AI automatically detects available hardware:
